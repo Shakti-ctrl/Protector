@@ -1,0 +1,99 @@
+name: Build Debug APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+    paths:
+      - 'android-app/**'
+      - '.github/workflows/build-debug-apk.yml'
+  pull_request:
+    branches:
+      - main
+      - master
+    paths:
+      - 'android-app/**'
+      - '.github/workflows/build-debug-apk.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Debug APK
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Set up Android SDK
+        run: |
+          ANDROID_SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=${ANDROID_SDK_ROOT}" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}" >> $GITHUB_ENV
+          CMDLINE_TOOLS="${ANDROID_SDK_ROOT}/cmdline-tools"
+          if [ -d "${CMDLINE_TOOLS}/latest/bin" ]; then
+            echo "${CMDLINE_TOOLS}/latest/bin" >> $GITHUB_PATH
+          elif [ -d "${CMDLINE_TOOLS}/bin" ]; then
+            echo "${CMDLINE_TOOLS}/bin" >> $GITHUB_PATH
+          fi
+          echo "${ANDROID_SDK_ROOT}/platform-tools" >> $GITHUB_PATH
+
+      - name: Accept licenses and install SDK components
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            android-app/.gradle
+          key: gradle-${{ runner.os }}-${{ hashFiles('android-app/gradle/wrapper/gradle-wrapper.properties', 'android-app/gradle/libs.versions.toml', 'android-app/app/build.gradle.kts') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Grant execute permission to gradlew
+        run: chmod +x android-app/gradlew
+
+      - name: Build Debug APK
+        working-directory: android-app
+        run: bash ./gradlew assembleDebug --no-daemon --stacktrace
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false -Dkotlin.incremental=false"
+
+      - name: Get APK info
+        working-directory: android-app
+        run: |
+          APK_PATH=$(find app/build/outputs/apk/debug -name "*.apk" | head -1)
+          echo "APK_PATH=$APK_PATH" >> $GITHUB_ENV
+          echo "APK found at: $APK_PATH"
+          ls -lh "$APK_PATH"
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: FileVaultPro-debug-${{ github.run_number }}
+          path: android-app/app/build/outputs/apk/debug/*.apk
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Build summary
+        run: |
+          echo "## Build Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**APK:** \`FileVaultPro-debug-${{ github.run_number }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Download the APK from the **Artifacts** section of this run." >> $GITHUB_STEP_SUMMARY
