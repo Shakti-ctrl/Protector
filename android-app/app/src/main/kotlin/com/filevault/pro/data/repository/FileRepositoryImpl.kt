@@ -2,9 +2,13 @@ package com.filevault.pro.data.repository
 
 import android.content.ContentUris
 import android.content.Context
+import android.database.ContentObserver
 import android.database.Cursor
+import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.util.Log
 import com.filevault.pro.data.local.dao.ExcludedFolderDao
@@ -24,9 +28,12 @@ import com.filevault.pro.domain.repository.FileRepository
 import com.filevault.pro.util.FileUtils
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
@@ -44,43 +51,232 @@ class FileRepositoryImpl @Inject constructor(
     }
 
     override fun getAllPhotos(sortOrder: SortOrder, filter: FileFilter): Flow<List<FileEntry>> =
-        if (filter.searchQuery.isBlank()) fileEntryDao.getAllPhotosFlow()
-            .map { list -> list.map { it.toDomain() }.applySortAndFilter(sortOrder, filter) }
-        else fileEntryDao.searchPhotos(filter.searchQuery)
-            .map { list -> list.map { it.toDomain() }.applySortAndFilter(sortOrder, filter) }
+        callbackFlow {
+            fun doQuery(): List<FileEntry> {
+                val list = mutableListOf<FileEntry>()
+                val sortCol = when (sortOrder.field) {
+                    SortField.DATE_TAKEN -> MediaStore.Images.Media.DATE_TAKEN
+                    SortField.DATE_ADDED -> MediaStore.Images.Media.DATE_ADDED
+                    SortField.NAME -> MediaStore.Images.Media.DISPLAY_NAME
+                    SortField.SIZE -> MediaStore.Images.Media.SIZE
+                    else -> MediaStore.Images.Media.DATE_MODIFIED
+                }
+                val sortDir = if (sortOrder.ascending) "ASC" else "DESC"
+                val projection = arrayOf(
+                    MediaStore.Images.Media._ID,
+                    MediaStore.Images.Media.DATA,
+                    MediaStore.Images.Media.DISPLAY_NAME,
+                    MediaStore.Images.Media.SIZE,
+                    MediaStore.Images.Media.DATE_MODIFIED,
+                    MediaStore.Images.Media.DATE_ADDED,
+                    MediaStore.Images.Media.MIME_TYPE,
+                    MediaStore.Images.Media.WIDTH,
+                    MediaStore.Images.Media.HEIGHT,
+                    MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
+                    MediaStore.Images.Media.DATE_TAKEN
+                )
+                try {
+                    context.contentResolver.query(
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                        projection, null, null, "$sortCol $sortDir"
+                    )?.use { cursor ->
+                        val idxData = cursor.getColumnIndex(MediaStore.Images.Media.DATA)
+                        val idxName = cursor.getColumnIndex(MediaStore.Images.Media.DISPLAY_NAME)
+                        val idxSize = cursor.getColumnIndex(MediaStore.Images.Media.SIZE)
+                        val idxMod = cursor.getColumnIndex(MediaStore.Images.Media.DATE_MODIFIED)
+                        val idxAdd = cursor.getColumnIndex(MediaStore.Images.Media.DATE_ADDED)
+                        val idxMime = cursor.getColumnIndex(MediaStore.Images.Media.MIME_TYPE)
+                        val idxW = cursor.getColumnIndex(MediaStore.Images.Media.WIDTH)
+                        val idxH = cursor.getColumnIndex(MediaStore.Images.Media.HEIGHT)
+                        val idxBkt = cursor.getColumnIndex(MediaStore.Images.Media.BUCKET_DISPLAY_NAME)
+                        val idxTkn = cursor.getColumnIndex(MediaStore.Images.Media.DATE_TAKEN)
+                        while (cursor.moveToNext()) {
+                            val path = if (idxData >= 0) cursor.getString(idxData) else null
+                            if (path.isNullOrBlank()) continue
+                            val name = if (idxName >= 0) cursor.getString(idxName)
+                                ?: File(path).name else File(path).name
+                            if (!filter.showHidden && (name.startsWith(".") || path.contains("/."))) continue
+                            val q = filter.searchQuery
+                            if (q.isNotBlank() && !name.contains(q, ignoreCase = true)) continue
+                            val size = if (idxSize >= 0) cursor.getLong(idxSize) else 0L
+                            val mod = if (idxMod >= 0) cursor.getLong(idxMod) * 1000L else 0L
+                            val added = if (idxAdd >= 0) cursor.getLong(idxAdd) * 1000L
+                                else System.currentTimeMillis()
+                            val mime = if (idxMime >= 0) cursor.getString(idxMime).orEmpty() else ""
+                            val width = if (idxW >= 0) cursor.getInt(idxW).takeIf { it > 0 } else null
+                            val height = if (idxH >= 0) cursor.getInt(idxH).takeIf { it > 0 } else null
+                            val bucket = if (idxBkt >= 0) cursor.getString(idxBkt).orEmpty() else ""
+                            val dateTaken = if (idxTkn >= 0) cursor.getLong(idxTkn).takeIf { it > 0 } else null
+                            list += FileEntry(
+                                path = path, name = name,
+                                folderPath = File(path).parent ?: "", folderName = bucket,
+                                sizeBytes = size, lastModified = mod, mimeType = mime,
+                                fileType = FileType.PHOTO,
+                                width = width, height = height, durationMs = null,
+                                orientation = null, cameraMake = null, cameraModel = null,
+                                hasGps = false, dateTaken = dateTaken, dateAdded = added,
+                                isHidden = name.startsWith("."),
+                                contentHash = null, thumbnailCachePath = null,
+                                isSyncIgnored = false, lastSyncedAt = null,
+                                isDeletedFromDevice = false
+                            )
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "getAllPhotos MediaStore query failed: ${e.message}", e)
+                }
+                return list
+            }
+
+            launch(Dispatchers.IO) {
+                try { send(doQuery()) } catch (e: Exception) { Log.e(TAG, "send photos failed", e) }
+            }
+
+            val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+                override fun onChange(selfChange: Boolean) {
+                    launch(Dispatchers.IO) {
+                        try { trySend(doQuery()) } catch (e: Exception) { Log.e(TAG, "trySend photos failed", e) }
+                    }
+                }
+            }
+            context.contentResolver.registerContentObserver(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true, observer
+            )
+            awaitClose { context.contentResolver.unregisterContentObserver(observer) }
+        }
 
     override fun getAllVideos(sortOrder: SortOrder, filter: FileFilter): Flow<List<FileEntry>> =
-        if (filter.searchQuery.isBlank()) fileEntryDao.getAllVideosFlow()
-            .map { list -> list.map { it.toDomain() }.applySortAndFilter(sortOrder, filter) }
-        else fileEntryDao.searchVideos(filter.searchQuery)
-            .map { list -> list.map { it.toDomain() }.applySortAndFilter(sortOrder, filter) }
+        callbackFlow {
+            fun doQuery(): List<FileEntry> {
+                val list = mutableListOf<FileEntry>()
+                val sortCol = when (sortOrder.field) {
+                    SortField.DATE_ADDED -> MediaStore.Video.Media.DATE_ADDED
+                    SortField.NAME -> MediaStore.Video.Media.DISPLAY_NAME
+                    SortField.SIZE -> MediaStore.Video.Media.SIZE
+                    SortField.DURATION -> MediaStore.Video.Media.DURATION
+                    else -> MediaStore.Video.Media.DATE_MODIFIED
+                }
+                val sortDir = if (sortOrder.ascending) "ASC" else "DESC"
+                val projection = arrayOf(
+                    MediaStore.Video.Media._ID,
+                    MediaStore.Video.Media.DATA,
+                    MediaStore.Video.Media.DISPLAY_NAME,
+                    MediaStore.Video.Media.SIZE,
+                    MediaStore.Video.Media.DATE_MODIFIED,
+                    MediaStore.Video.Media.DATE_ADDED,
+                    MediaStore.Video.Media.MIME_TYPE,
+                    MediaStore.Video.Media.WIDTH,
+                    MediaStore.Video.Media.HEIGHT,
+                    MediaStore.Video.Media.BUCKET_DISPLAY_NAME,
+                    MediaStore.Video.Media.DURATION
+                )
+                try {
+                    context.contentResolver.query(
+                        MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                        projection, null, null, "$sortCol $sortDir"
+                    )?.use { cursor ->
+                        val idxData = cursor.getColumnIndex(MediaStore.Video.Media.DATA)
+                        val idxName = cursor.getColumnIndex(MediaStore.Video.Media.DISPLAY_NAME)
+                        val idxSize = cursor.getColumnIndex(MediaStore.Video.Media.SIZE)
+                        val idxMod = cursor.getColumnIndex(MediaStore.Video.Media.DATE_MODIFIED)
+                        val idxAdd = cursor.getColumnIndex(MediaStore.Video.Media.DATE_ADDED)
+                        val idxMime = cursor.getColumnIndex(MediaStore.Video.Media.MIME_TYPE)
+                        val idxW = cursor.getColumnIndex(MediaStore.Video.Media.WIDTH)
+                        val idxH = cursor.getColumnIndex(MediaStore.Video.Media.HEIGHT)
+                        val idxBkt = cursor.getColumnIndex(MediaStore.Video.Media.BUCKET_DISPLAY_NAME)
+                        val idxDur = cursor.getColumnIndex(MediaStore.Video.Media.DURATION)
+                        while (cursor.moveToNext()) {
+                            val path = if (idxData >= 0) cursor.getString(idxData) else null
+                            if (path.isNullOrBlank()) continue
+                            val name = if (idxName >= 0) cursor.getString(idxName)
+                                ?: File(path).name else File(path).name
+                            if (!filter.showHidden && (name.startsWith(".") || path.contains("/."))) continue
+                            val q = filter.searchQuery
+                            if (q.isNotBlank() && !name.contains(q, ignoreCase = true)) continue
+                            val size = if (idxSize >= 0) cursor.getLong(idxSize) else 0L
+                            val mod = if (idxMod >= 0) cursor.getLong(idxMod) * 1000L else 0L
+                            val added = if (idxAdd >= 0) cursor.getLong(idxAdd) * 1000L
+                                else System.currentTimeMillis()
+                            val mime = if (idxMime >= 0) cursor.getString(idxMime).orEmpty() else ""
+                            val width = if (idxW >= 0) cursor.getInt(idxW).takeIf { it > 0 } else null
+                            val height = if (idxH >= 0) cursor.getInt(idxH).takeIf { it > 0 } else null
+                            val bucket = if (idxBkt >= 0) cursor.getString(idxBkt).orEmpty() else ""
+                            val duration = if (idxDur >= 0) cursor.getLong(idxDur).takeIf { it > 0 } else null
+                            list += FileEntry(
+                                path = path, name = name,
+                                folderPath = File(path).parent ?: "", folderName = bucket,
+                                sizeBytes = size, lastModified = mod, mimeType = mime,
+                                fileType = FileType.VIDEO,
+                                width = width, height = height, durationMs = duration,
+                                orientation = null, cameraMake = null, cameraModel = null,
+                                hasGps = false, dateTaken = null, dateAdded = added,
+                                isHidden = name.startsWith("."),
+                                contentHash = null, thumbnailCachePath = null,
+                                isSyncIgnored = false, lastSyncedAt = null,
+                                isDeletedFromDevice = false
+                            )
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "getAllVideos MediaStore query failed: ${e.message}", e)
+                }
+                return list
+            }
+
+            launch(Dispatchers.IO) {
+                try { send(doQuery()) } catch (e: Exception) { Log.e(TAG, "send videos failed", e) }
+            }
+
+            val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+                override fun onChange(selfChange: Boolean) {
+                    launch(Dispatchers.IO) {
+                        try { trySend(doQuery()) } catch (e: Exception) { Log.e(TAG, "trySend videos failed", e) }
+                    }
+                }
+            }
+            context.contentResolver.registerContentObserver(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true, observer
+            )
+            awaitClose { context.contentResolver.unregisterContentObserver(observer) }
+        }
 
     override fun getAllFiles(sortOrder: SortOrder, filter: FileFilter): Flow<List<FileEntry>> =
         fileEntryDao.searchFiles(filter.searchQuery)
             .map { list -> list.map { it.toDomain() }.applySortAndFilter(sortOrder, filter) }
 
-    override fun getStats(): Flow<CatalogStats> {
-        return combine(
-            fileEntryDao.getTotalCount(),
-            fileEntryDao.getPhotoCount(),
-            fileEntryDao.getVideoCount(),
-            fileEntryDao.getAudioCount(),
-            fileEntryDao.getDocumentCount(),
-            fileEntryDao.getTotalSizeBytes()
-        ) { values ->
-            CatalogStats(
-                totalFiles = values[0] as Int,
-                totalPhotos = values[1] as Int,
-                totalVideos = values[2] as Int,
-                totalAudio = values[3] as Int,
-                totalDocuments = values[4] as Int,
-                totalOther = (values[0] as Int) - (values[1] as Int) - (values[2] as Int) -
-                        (values[3] as Int) - (values[4] as Int),
-                totalSizeBytes = (values[5] as Long?) ?: 0L,
-                lastScanAt = null,
-                lastSyncAt = null
-            )
+    override fun getStats(): Flow<CatalogStats> = callbackFlow {
+        fun doQuery(): CatalogStats {
+            fun qCount(uri: Uri): Int {
+                val c = context.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns._ID), null, null, null)
+                val n = c?.count ?: 0; c?.close(); return n
+            }
+            return try {
+                val photos = qCount(MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
+                val videos = qCount(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+                val audio = qCount(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
+                val total = qCount(MediaStore.Files.getContentUri("external"))
+                val docs = (total - photos - videos - audio).coerceAtLeast(0)
+                CatalogStats(
+                    totalFiles = total, totalPhotos = photos, totalVideos = videos,
+                    totalAudio = audio, totalDocuments = docs, totalOther = 0,
+                    totalSizeBytes = 0L, lastScanAt = null, lastSyncAt = null
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "getStats MediaStore query failed: ${e.message}", e)
+                CatalogStats(0, 0, 0, 0, 0, 0, 0L, null, null)
+            }
         }
+
+        launch(Dispatchers.IO) { send(doQuery()) }
+
+        val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) {
+                launch(Dispatchers.IO) { trySend(doQuery()) }
+            }
+        }
+        context.contentResolver.registerContentObserver(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true, observer)
+        context.contentResolver.registerContentObserver(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true, observer)
+        awaitClose { context.contentResolver.unregisterContentObserver(observer) }
     }
 
     override fun getFolders(): Flow<List<FolderInfo>> =
@@ -268,14 +464,12 @@ class FileRepositoryImpl @Inject constructor(
 
         Log.d(TAG, "performMediaStoreScan: starting 4-phase scan")
 
-        // Phase 1 — Images (DATE_TAKEN gives better sort-by-date)
         total += queryAndStore(
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
             baseProjection(MediaStore.Images.ImageColumns.DATE_TAKEN),
             FileType.PHOTO
         )
 
-        // Phase 2 — Videos (DURATION + DATE_TAKEN)
         total += queryAndStore(
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
             baseProjection(
@@ -285,17 +479,12 @@ class FileRepositoryImpl @Inject constructor(
             FileType.VIDEO
         )
 
-        // Phase 3 — Audio (DURATION)
         total += queryAndStore(
             MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
             baseProjection(MediaStore.Audio.AudioColumns.DURATION),
             FileType.AUDIO
         )
 
-        // Phase 4 — All files (catches documents, APKs, archives, etc.)
-        // ⚠ NO SIZE > 0 filter: Android 15 can store NULL size before full indexing,
-        //   and NULL > 0 is FALSE in SQL — silently excluding ALL unindexed files.
-        // Already-seen paths (from phases 1-3) are skipped via seenPaths dedup.
         total += queryAndStore(
             MediaStore.Files.getContentUri("external"),
             baseProjection(),
@@ -312,12 +501,7 @@ class FileRepositoryImpl @Inject constructor(
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (!Environment.isExternalStorageManager()) {
-                Log.w(
-                    TAG,
-                    "performFileSystemWalk: MANAGE_EXTERNAL_STORAGE not granted at runtime. " +
-                        "Skipping file system walk. Go to Settings > Apps > FileVaultPro > " +
-                        "Permissions and enable 'All files access'."
-                )
+                Log.w(TAG, "performFileSystemWalk: MANAGE_EXTERNAL_STORAGE not granted — skipping")
                 return@withContext 0
             }
         }
@@ -327,17 +511,12 @@ class FileRepositoryImpl @Inject constructor(
         val roots = FileUtils.getExternalStorageRoots(context)
 
         if (roots.isEmpty()) {
-            Log.w(TAG, "performFileSystemWalk: no accessible storage roots found — nothing to walk")
+            Log.w(TAG, "performFileSystemWalk: no accessible storage roots found")
             return@withContext 0
         }
 
-        Log.d(TAG, "performFileSystemWalk: walking ${roots.size} root(s): ${roots.map { it.absolutePath }}")
-
         for (root in roots) {
-            if (!root.exists() || !root.canRead()) {
-                Log.w(TAG, "performFileSystemWalk: skipping root ${root.absolutePath} — not accessible")
-                continue
-            }
+            if (!root.exists() || !root.canRead()) continue
 
             val buffer = mutableListOf<FileEntryEntity>()
 

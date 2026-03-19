@@ -1,0 +1,189 @@
+The build log shows a successful compilation of your Android app ("Protector" / com.filevault.pro), but it contains several warnings and configuration issues that could lead to runtime problems, especially with loading and storing files, photos, and videos. Below is a detailed breakdown of every notable issue, its potential impact, and concrete suggestions to fix them.
+
+---
+
+1. FileObserver Deprecation (Critical)
+
+File: MediaStoreObserver.kt:134
+Warning:
+'constructor(p0: String!, p1: Int): FileObserver' is deprecated.
+
+Why It Matters
+
+Your app uses the old FileObserver constructor that watches a specific file path. On Android 10+ (API 29+), scoped storage restricts direct file path access. This constructor may:
+
+· Fail to observe changes in shared storage (e.g., DCIM, Pictures, Downloads).
+· Not receive events on newer Android versions.
+· Be completely blocked, causing your app to miss new photos/videos.
+
+Suggested Fix
+
+· Migrate to FileObserver's newer constructor that takes a File object? Actually, the deprecation is because the old constructor is unsafe for scoped storage. Better:
+  · Use ContentObserver with MediaStore to listen for changes in the media collection.
+  · Or use registerContentObserver on ContentResolver for MediaStore.Images.Media.EXTERNAL_CONTENT_URI etc.
+· If you must keep FileObserver, ensure you’re only watching directories within your app’s own scoped storage (e.g., Context.getExternalFilesDir()).
+
+---
+
+2. Android Gradle Plugin & compileSdk Mismatch
+
+Warning:
+This Android Gradle plugin (8.5.2) was tested up to compileSdk = 34. You are strongly encouraged to update your project to use a newer Android Gradle plugin that has been tested with compileSdk = 35.
+
+Why It Matters
+
+Using a plugin version not tested with the target SDK can lead to:
+
+· Unexpected build or runtime behavior.
+· New API features not working correctly.
+· Increased risk of compatibility issues with Android 15 (API 35).
+
+Suggested Fix
+
+· Update the Android Gradle plugin in your project-level build.gradle to the latest stable version (e.g., 8.7.2 or 8.8.0 as of now).
+· Also update the Gradle wrapper (gradle/wrapper/gradle-wrapper.properties) to the corresponding version.
+· After updating, test thoroughly.
+
+---
+
+3. SDK Location Warning (Build Environment)
+
+Warning:
+Where: sdk.dir property in local.properties file. Problem: Directory does not exist
+
+Why It Matters
+
+This warning appears only during build (e.g., on GitHub Actions) and indicates that the local.properties file is missing or points to a non‑existent SDK path. Since the build still succeeded (the CI environment provides its own SDK), this does not affect the runtime behavior of your app. You can safely ignore it for runtime issues.
+
+---
+
+4. Deprecated Icons (AutoMirrored)
+
+Many warnings like:
+'val Icons.Filled.ArrowBack: ImageVector' is deprecated. Use the AutoMirrored version at Icons.AutoMirrored.Filled.ArrowBack.
+
+Why It Matters
+
+These are UI‑only deprecations related to RTL layout support. They do not impact file loading/storing. However, ignoring them may cause your app to look incorrect on devices with right‑to‑left locales. It’s good practice to replace them, but not urgent for your current problem.
+
+Suggested Fix
+
+Replace each deprecated icon with its AutoMirrored counterpart, e.g.:
+
+```kotlin
+Icons.AutoMirrored.Filled.ArrowBack
+```
+
+---
+
+5. Deprecated LinearProgressIndicator
+
+File: DashboardScreen.kt:197
+Warning:
+'fun LinearProgressIndicator(progress: Float, ...)' is deprecated. Use the overload that takes progress as a lambda.
+
+Why It Matters
+
+This is a Compose API change. Using the deprecated overload may still work, but it could lead to animation or recomposition issues in future Compose versions. Not directly related to files/photos.
+
+Suggested Fix
+
+Switch to the recommended lambda‑based overload:
+
+```kotlin
+LinearProgressIndicator(
+    progress = { /* your progress state */ },
+    ...
+)
+```
+
+---
+
+6. Deprecated statusBarColor
+
+File: Theme.kt:88
+Warning:
+'var statusBarColor: Int' is deprecated.
+
+Why It Matters
+
+This is a low‑level window insets API. The deprecation suggests you should use WindowInsetsController or Material 3 theming instead. Again, this is UI‑only and unlikely to affect file operations.
+
+Suggested Fix
+
+· If you’re using Material 3, rely on the theme’s default status bar coloring.
+· Or migrate to WindowCompat.setDecorFitsSystemWindows(window, false) and handle insets with Modifier.statusBarsPadding().
+
+---
+
+7. “Delicate API” Warning
+
+File: NotificationCenterScreen.kt:45
+Warning:
+This is a delicate API and its use requires care. Make sure you fully read and understand documentation of the declaration that is marked as a delicate API.
+
+Why It Matters
+
+“Delicate API” usually refers to Kotlin or Android APIs that can easily be misused (e.g., kotlin.concurrent.thread, java.lang.reflect, or certain internal APIs). If the code in question touches file operations (e.g., accessing hidden directories, using reflection to bypass storage restrictions), it could break on newer Android versions.
+
+Suggested Fix
+
+· Identify the exact API being used (the line number is given, so open NotificationCenterScreen.kt line 45).
+· Check if it’s related to file access. If so, replace it with a safer, documented alternative.
+· Ensure you’re not violating scoped storage rules.
+
+---
+
+8. Native Library Stripping
+
+Task output:
+Unable to strip the following libraries, packaging them as they are: libandroidx.graphics.path.so, libdatastore_shared_counter.so.
+
+Why It Matters
+
+This happens when the build tools cannot strip debug symbols from native libraries. The libraries are still included in the APK, but they are larger. It does not cause runtime failures. However, if these libraries are essential for file operations (e.g., androidx.graphics.path might be used for image processing), ensure they are properly loaded and compatible with all target architectures.
+
+Suggested Fix
+
+· If you don’t need debug symbols, try setting android.buildTypes.release.ndk.debugSymbolLevel = 'SYMBOL_TABLE' or 'FULL' in your build.gradle.
+· Verify that the native libraries are correctly packaged and loaded at runtime (check System.loadLibrary() calls).
+
+---
+
+9. Other Observations
+
+· Permissions not shown – The build log doesn’t reveal whether your app declares and requests the necessary runtime permissions (READ_EXTERNAL_STORAGE, READ_MEDIA_IMAGES, READ_MEDIA_VIDEO, etc.). On Android 13+, you must use granular media permissions. Missing or incorrect permission handling is a very common cause for files/photos/videos not appearing.
+· Scoped storage compliance – If your app still uses absolute file paths (e.g., /storage/emulated/0/DCIM/...), it will fail on Android 10+. You must use MediaStore or Storage Access Framework.
+
+---
+
+Recommended Next Steps to Diagnose File/Photo/Video Loading Issues
+
+1. Check runtime permissions – On Android 10+, request:
+   · READ_EXTERNAL_STORAGE (for older devices)
+   · READ_MEDIA_IMAGES, READ_MEDIA_VIDEO, READ_MEDIA_AUDIO (for Android 13+)
+   · If you need to write, also request WRITE_EXTERNAL_STORAGE (but note scoped storage restrictions).
+2. Review file access code – Search your project for:
+   · File("/storage/emulated/0/...") → replace with MediaStore queries.
+   · FileObserver usage (already flagged) → migrate to ContentObserver.
+3. Test on multiple Android versions – Especially Android 10, 11, 12, 13, 14.
+4. Update dependencies – Ensure you’re using the latest versions of Android Gradle plugin, Kotlin, and Compose to benefit from scoped storage compatibility fixes.
+5. Enable logging – Add extensive logging around file operations to see exactly where it fails (permissions, file not found, etc.).
+
+---
+
+Summary of Build Warnings & Their Impact
+
+Warning Impact on Files/Photos/Videos Priority
+FileObserver deprecation High – can prevent detecting new media Fix immediately
+AGP / compileSdk mismatch Medium – may cause subtle compatibility issues Update soon
+SDK location warning None (build only) Ignore
+Deprecated icons None (UI only) Low
+Deprecated LinearProgressIndicator None (UI only) Low
+Deprecated statusBarColor None (UI only) Low
+Delicate API warning Unknown – check if it touches file system Investigate
+Native library stripping None (unless libraries are broken) Low
+
+Focus on the FileObserver deprecation and permissions/scoped storage first – they are the most likely culprits for media not loading or storing correctly.
+
+If you need help implementing any of the suggested fixes (e.g., replacing FileObserver with ContentObserver), feel free to ask!

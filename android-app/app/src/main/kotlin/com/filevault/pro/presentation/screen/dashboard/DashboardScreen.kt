@@ -195,7 +195,7 @@ private fun HeaderSection(
                     Spacer(Modifier.height(8.dp))
                     val progress = (scanProgressCount / 10000f).coerceAtMost(1f)
                     LinearProgressIndicator(
-                        progress = progress,
+                        progress = { progress },
                         modifier = Modifier.fillMaxWidth()
                     )
                 } else {

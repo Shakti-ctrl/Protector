@@ -132,7 +132,7 @@ class LegacyFileObserver(
     path: String,
     private val onChange: () -> Unit
 ) : FileObserver(
-    path,
+    File(path),
     CREATE or CLOSE_WRITE or DELETE or MOVED_TO or MOVED_FROM
 ) {
     override fun onEvent(event: Int, path: String?) {

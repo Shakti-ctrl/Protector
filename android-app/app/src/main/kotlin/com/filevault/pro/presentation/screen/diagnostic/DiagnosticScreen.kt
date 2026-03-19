@@ -1,10 +1,14 @@
 package com.filevault.pro.presentation.screen.diagnostic
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -64,6 +68,34 @@ fun DiagnosticScreen(onBack: () -> Unit) {
     var checks by remember { mutableStateOf<List<DiagnosticCheck>>(emptyList()) }
     var logLines by remember { mutableStateOf<List<String>>(emptyList()) }
     var hasRun by remember { mutableStateOf(false) }
+
+    fun buildCopyText(checkList: List<DiagnosticCheck>, log: List<String>): String {
+        val sb = StringBuilder()
+        sb.appendLine("=== FileVault Pro — Storage Diagnostic Report ===")
+        sb.appendLine("Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
+        sb.appendLine("${Build.MANUFACTURER} ${Build.MODEL}")
+        sb.appendLine()
+        checkList.forEach { check ->
+            val statusLabel = when (check.status) {
+                DiagnosticStatus.PASS -> "[PASS]"
+                DiagnosticStatus.WARN -> "[WARN]"
+                DiagnosticStatus.FAIL -> "[FAIL]"
+            }
+            sb.appendLine("$statusLabel ${check.name}")
+            sb.appendLine(check.detail)
+            if (check.fix != null) sb.appendLine("Fix: ${check.fix}")
+            sb.appendLine()
+        }
+        sb.appendLine("--- Raw Log ---")
+        log.forEach { sb.appendLine(it) }
+        return sb.toString()
+    }
+
+    fun copyToClipboard(text: String) {
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("FileVault Diagnostic", text))
+        Toast.makeText(context, "Diagnostic copied to clipboard", Toast.LENGTH_SHORT).show()
+    }
 
     fun runDiagnostics() {
         scope.launch {
@@ -205,8 +237,33 @@ fun DiagnosticScreen(onBack: () -> Unit) {
                 }
             ))
 
-            // 6 — File system walk (capped at 2000)
-            addLog("[6] File system walk (cap 2000)...")
+            // 6 — App loading check (direct MediaStore vs what app shows)
+            addLog("[6] App loading check...")
+            val appLoadSb = StringBuilder()
+            val canLoadPhotos = allMedia && msImages > 0
+            val canLoadVideos = allMedia && msVideos > 0
+            appLoadSb.appendLine("Photos screen: MediaStore has $msImages images")
+            appLoadSb.appendLine("  → App now reads directly from MediaStore (no scan needed)")
+            appLoadSb.appendLine("Videos screen: MediaStore has $msVideos videos")
+            appLoadSb.appendLine("  → App now reads directly from MediaStore (no scan needed)")
+            if (!allMedia) appLoadSb.appendLine("WARNING: Media permissions denied — screens will show empty")
+            addCheck(DiagnosticCheck(
+                name = "App Photos/Videos Loading",
+                status = when {
+                    !allMedia -> DiagnosticStatus.FAIL
+                    msImages == 0 && msVideos == 0 -> DiagnosticStatus.WARN
+                    else -> DiagnosticStatus.PASS
+                },
+                detail = appLoadSb.trimEnd().toString(),
+                fix = when {
+                    !allMedia -> "Grant READ_MEDIA_IMAGES and READ_MEDIA_VIDEO permissions"
+                    msImages == 0 && msVideos == 0 -> "MediaStore has no media — open the Gallery app to force indexing"
+                    else -> null
+                }
+            ))
+
+            // 7 — File system walk (capped at 2000)
+            addLog("[7] File system walk (cap 2000)...")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
                 addLog("    SKIPPED — MANAGE_EXTERNAL_STORAGE not granted")
                 addCheck(DiagnosticCheck(
@@ -254,8 +311,8 @@ fun DiagnosticScreen(onBack: () -> Unit) {
                 ))
             }
 
-            // 7 — Known directories
-            addLog("[7] Common directories...")
+            // 8 — Known directories
+            addLog("[8] Common directories...")
             val knownDirs = listOf("DCIM", "Pictures", "Movies", "Download", "Music", "Documents", "WhatsApp/Media", "Telegram")
             val dirSb = StringBuilder()
             var anyDirFound = false
@@ -293,6 +350,15 @@ fun DiagnosticScreen(onBack: () -> Unit) {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
                     }
+                },
+                actions = {
+                    if (hasRun && !isRunning) {
+                        IconButton(onClick = {
+                            copyToClipboard(buildCopyText(checks, logLines))
+                        }) {
+                            Icon(Icons.Default.ContentCopy, contentDescription = "Copy diagnostic")
+                        }
+                    }
                 }
             )
         }
@@ -317,19 +383,30 @@ fun DiagnosticScreen(onBack: () -> Unit) {
                             color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f)
                         )
                         Spacer(Modifier.height(12.dp))
-                        Button(
-                            onClick = { if (!isRunning) runDiagnostics() },
-                            modifier = Modifier.fillMaxWidth(),
-                            enabled = !isRunning
-                        ) {
-                            if (isRunning) {
-                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onPrimary)
-                                Spacer(Modifier.width(8.dp))
-                                Text("Running…")
-                            } else {
-                                Icon(Icons.Default.PlayArrow, null, Modifier.size(18.dp))
-                                Spacer(Modifier.width(8.dp))
-                                Text(if (hasRun) "Run Again" else "Run Diagnostic")
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { if (!isRunning) runDiagnostics() },
+                                modifier = Modifier.weight(1f),
+                                enabled = !isRunning
+                            ) {
+                                if (isRunning) {
+                                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onPrimary)
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("Running…")
+                                } else {
+                                    Icon(Icons.Default.PlayArrow, null, Modifier.size(18.dp))
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(if (hasRun) "Run Again" else "Run Diagnostic")
+                                }
+                            }
+                            if (hasRun && !isRunning) {
+                                OutlinedButton(
+                                    onClick = { copyToClipboard(buildCopyText(checks, logLines)) }
+                                ) {
+                                    Icon(Icons.Default.ContentCopy, null, Modifier.size(18.dp))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Copy")
+                                }
                             }
                         }
                     }
@@ -365,7 +442,19 @@ fun DiagnosticScreen(onBack: () -> Unit) {
                         shape = RoundedCornerShape(12.dp)
                     ) {
                         Column(modifier = Modifier.padding(12.dp)) {
-                            Text("Raw Log", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Raw Log", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                                IconButton(
+                                    onClick = { copyToClipboard(buildCopyText(checks, logLines)) },
+                                    modifier = Modifier.size(32.dp)
+                                ) {
+                                    Icon(Icons.Default.ContentCopy, "Copy log", Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                                }
+                            }
                             Spacer(Modifier.height(6.dp))
                             logLines.forEach { line ->
                                 Text(line, fontFamily = FontFamily.Monospace, fontSize = 10.sp, lineHeight = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -396,7 +485,7 @@ private fun DiagnosticCheckCard(check: DiagnosticCheck) {
                     Icon(check.status.icon, null, tint = check.status.color, modifier = Modifier.size(18.dp))
                 }
                 Spacer(Modifier.width(10.dp))
-                Text(check.name, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium)
+                Text(check.name, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
             }
             Spacer(Modifier.height(8.dp))
             Text(
