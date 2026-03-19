@@ -2,11 +2,11 @@ package com.filevault.pro.data.repository
 
 import android.content.ContentUris
 import android.content.Context
+import android.database.Cursor
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
-import android.webkit.MimeTypeMap
 import com.filevault.pro.data.local.dao.ExcludedFolderDao
 import com.filevault.pro.data.local.dao.FileEntryDao
 import com.filevault.pro.data.local.entity.FileEntryEntity
@@ -26,7 +26,6 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -44,10 +43,7 @@ class FileRepositoryImpl @Inject constructor(
         const val TAG = "FileRepository"
     }
 
-    override fun getAllPhotos(
-        sortOrder: SortOrder,
-        filter: FileFilter
-    ): Flow<List<FileEntry>> =
+    override fun getAllPhotos(sortOrder: SortOrder, filter: FileFilter): Flow<List<FileEntry>> =
         if (filter.searchQuery.isBlank()) fileEntryDao.getAllPhotosFlow()
             .map { list -> list.map { it.toDomain() }.applySortAndFilter(sortOrder, filter) }
         else fileEntryDao.searchPhotos(filter.searchQuery)
@@ -126,149 +122,188 @@ class FileRepositoryImpl @Inject constructor(
         }
     }
 
-    override suspend fun performMediaStoreScan(): Int {
-        var count = 0
-        var skippedCount = 0
-        val projection = buildList {
-            add(MediaStore.Files.FileColumns._ID)
-            add(MediaStore.Files.FileColumns.DATA)
-            add(MediaStore.Files.FileColumns.DISPLAY_NAME)
-            add(MediaStore.Files.FileColumns.SIZE)
-            add(MediaStore.Files.FileColumns.DATE_MODIFIED)
-            add(MediaStore.Files.FileColumns.MIME_TYPE)
+    override suspend fun performMediaStoreScan(): Int = withContext(Dispatchers.IO) {
+        val seenPaths = HashSet<String>(1024)
+        val excluded  = excludedFolderDao.getAllPaths().toSet()
+        var total = 0
+
+        fun baseProjection(vararg extra: String): Array<String> = buildList {
+            add(MediaStore.MediaColumns._ID)
+            add(MediaStore.MediaColumns.DATA)
+            add(MediaStore.MediaColumns.DISPLAY_NAME)
+            add(MediaStore.MediaColumns.SIZE)
+            add(MediaStore.MediaColumns.DATE_MODIFIED)
+            add(MediaStore.MediaColumns.MIME_TYPE)
             add(MediaStore.Files.FileColumns.BUCKET_DISPLAY_NAME)
-            add(MediaStore.Files.FileColumns.BUCKET_ID)
-            add(MediaStore.Files.FileColumns.WIDTH)
-            add(MediaStore.Files.FileColumns.HEIGHT)
-            add(MediaStore.Files.FileColumns.DATE_ADDED)
+            add(MediaStore.MediaColumns.WIDTH)
+            add(MediaStore.MediaColumns.HEIGHT)
+            add(MediaStore.MediaColumns.DATE_ADDED)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 add(MediaStore.MediaColumns.RELATIVE_PATH)
             }
-        }.toTypedArray()
+            addAll(extra)
+        }.distinct().toTypedArray()
 
-        Log.d(TAG, "performMediaStoreScan: querying MediaStore.Files on URI=${MediaStore.Files.getContentUri("external")}")
+        fun Cursor.extractEntities(defaultType: FileType?): List<FileEntryEntity> {
+            val list   = mutableListOf<FileEntryEntity>()
+            val idxId  = getColumnIndex(MediaStore.MediaColumns._ID)
+            val idxData= getColumnIndex(MediaStore.MediaColumns.DATA)
+            val idxName= getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
+            val idxSize= getColumnIndex(MediaStore.MediaColumns.SIZE)
+            val idxMod = getColumnIndex(MediaStore.MediaColumns.DATE_MODIFIED)
+            val idxMime= getColumnIndex(MediaStore.MediaColumns.MIME_TYPE)
+            val idxBkt = getColumnIndex(MediaStore.Files.FileColumns.BUCKET_DISPLAY_NAME)
+            val idxW   = getColumnIndex(MediaStore.MediaColumns.WIDTH)
+            val idxH   = getColumnIndex(MediaStore.MediaColumns.HEIGHT)
+            val idxAdd = getColumnIndex(MediaStore.MediaColumns.DATE_ADDED)
+            val idxRel = getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
+            val idxDur = getColumnIndex(MediaStore.Video.VideoColumns.DURATION)
+            val idxTkn = getColumnIndex(MediaStore.Images.ImageColumns.DATE_TAKEN)
 
-        val cursor = try {
-            context.contentResolver.query(
-                MediaStore.Files.getContentUri("external"),
-                projection,
-                "${MediaStore.Files.FileColumns.SIZE} > 0",
-                null,
-                "${MediaStore.Files.FileColumns.DATE_MODIFIED} DESC"
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "performMediaStoreScan: contentResolver.query threw an exception — likely missing READ_MEDIA_* permissions. ${e.message}", e)
-            null
-        }
+            while (moveToNext()) {
+                val rawPath  = if (idxData >= 0) getString(idxData) else null
+                val relPath  = if (idxRel  >= 0) getString(idxRel)  else null
+                val dispName = if (idxName >= 0) getString(idxName) else null
 
-        if (cursor == null) {
-            Log.e(
-                TAG,
-                "performMediaStoreScan: cursor is NULL. This means the app does not have the required " +
-                    "READ_MEDIA_IMAGES / READ_MEDIA_VIDEO / READ_MEDIA_AUDIO (Android 13+) or " +
-                    "READ_EXTERNAL_STORAGE (Android ≤12) permission granted at runtime. " +
-                    "Grant the permissions on the Permission screen and try again."
-            )
-            return 0
-        }
-
-        Log.d(TAG, "performMediaStoreScan: cursor returned ${cursor.count} raw rows from MediaStore")
-
-        cursor.use {
-            val excluded = excludedFolderDao.getAllPaths().toSet()
-            val entities = mutableListOf<FileEntryEntity>()
-
-            while (it.moveToNext()) {
-                val rawPath = it.getString(it.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DATA))
-                val relativePath = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    it.getString(it.getColumnIndexOrThrow(MediaStore.MediaColumns.RELATIVE_PATH))
-                } else null
-                val displayName = it.getString(it.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME))
                 val path = when {
                     !rawPath.isNullOrBlank() -> rawPath
-                    !relativePath.isNullOrBlank() && !displayName.isNullOrBlank() -> {
-                        val rel = relativePath.trimStart('/').let { r -> if (r.endsWith("/")) r else "$r/" }
-                        "${Environment.getExternalStorageDirectory().absolutePath}/$rel$displayName"
+                    !relPath.isNullOrBlank() && !dispName.isNullOrBlank() -> {
+                        val r = relPath.trimEnd('/') + "/"
+                        "${Environment.getExternalStorageDirectory().absolutePath}/${r}${dispName}"
                     }
-                    else -> {
-                        val id = it.getLong(it.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID))
-                        ContentUris.withAppendedId(MediaStore.Files.getContentUri("external"), id).toString()
-                    }
-                }
-                if (path.isBlank()) {
-                    skippedCount++
-                    continue
+                    idxId >= 0 -> ContentUris.withAppendedId(
+                        MediaStore.Files.getContentUri("external"), getLong(idxId)
+                    ).toString()
+                    else -> ""
                 }
 
-                val parentPath = if (path.startsWith("content://")) null else File(path).parent
-                if (parentPath != null && excluded.any { ex -> parentPath.startsWith(ex) }) continue
+                if (path.isBlank() || path in seenPaths) continue
 
-                val name = displayName ?: File(path).name
-                val size = it.getLong(it.getColumnIndexOrThrow(MediaStore.Files.FileColumns.SIZE))
-                val modified = it.getLong(it.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DATE_MODIFIED)) * 1000L
-                val mimeRaw = it.getString(it.getColumnIndexOrThrow(MediaStore.Files.FileColumns.MIME_TYPE)) ?: ""
-                val mime = mimeRaw.ifBlank {
-                    if (path.startsWith("content://")) "" else FileUtils.getMimeType(File(path))
+                val isContentUri = path.startsWith("content://")
+                val parentPath   = if (!isContentUri) File(path).parent else null
+                if (parentPath != null && excluded.any { path.startsWith(it) }) continue
+
+                seenPaths += path
+
+                val name      = dispName ?: if (!isContentUri) File(path).name else "file"
+                val size      = if (idxSize >= 0) getLong(idxSize) else 0L
+                val modified  = if (idxMod  >= 0) getLong(idxMod) * 1000L else 0L
+                val mimeRaw   = if (idxMime >= 0) getString(idxMime).orEmpty() else ""
+                val mime      = mimeRaw.ifBlank {
+                    if (!isContentUri) FileUtils.getMimeType(File(path)) else ""
                 }
-                val bucketName = it.getString(it.getColumnIndexOrThrow(MediaStore.Files.FileColumns.BUCKET_DISPLAY_NAME))
-                    ?: parentPath?.let { p -> File(p).name } ?: ""
-                val width = runCatching { it.getInt(it.getColumnIndexOrThrow(MediaStore.Files.FileColumns.WIDTH)) }.getOrNull()
-                val height = runCatching { it.getInt(it.getColumnIndexOrThrow(MediaStore.Files.FileColumns.HEIGHT)) }.getOrNull()
-                val dateAdded = it.getLong(it.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DATE_ADDED)) * 1000L
+                val bucket    = if (idxBkt >= 0) getString(idxBkt).orEmpty()
+                                else parentPath?.let { File(it).name } ?: ""
+                val width     = if (idxW  >= 0) getInt(idxW).takeIf  { it > 0 } else null
+                val height    = if (idxH  >= 0) getInt(idxH).takeIf  { it > 0 } else null
+                val dateAdded = if (idxAdd >= 0) getLong(idxAdd) * 1000L else System.currentTimeMillis()
+                val duration  = if (idxDur >= 0) getLong(idxDur).takeIf { it > 0 } else null
+                val dateTaken = if (idxTkn >= 0) getLong(idxTkn).takeIf { it > 0 } else null
 
-                val fileType = if (mime.isNotBlank()) FileType.fromMimeType(mime)
-                              else if (!path.startsWith("content://")) FileType.fromExtension(File(path).extension)
-                              else FileType.OTHER
+                val fileType = when {
+                    defaultType != null   -> defaultType
+                    mime.isNotBlank()     -> FileType.fromMimeType(mime)
+                    !isContentUri         -> FileType.fromExtension(File(path).extension)
+                    else                  -> FileType.OTHER
+                }
 
-                val resolvedParentPath = parentPath ?: ""
-
-                entities.add(
-                    FileEntryEntity(
-                        path = path,
-                        name = name,
-                        folderPath = resolvedParentPath,
-                        folderName = bucketName,
-                        sizeBytes = size,
-                        lastModified = modified,
-                        mimeType = mime,
-                        fileType = fileType.name,
-                        width = if ((width ?: 0) > 0) width else null,
-                        height = if ((height ?: 0) > 0) height else null,
-                        durationMs = null,
-                        orientation = null,
-                        cameraMake = null,
-                        cameraModel = null,
-                        hasGps = false,
-                        dateTaken = null,
-                        dateAdded = dateAdded,
-                        isHidden = if (path.startsWith("content://")) false else FileUtils.isHidden(File(path)),
-                        contentHash = null,
-                        thumbnailCachePath = null,
-                        isSyncIgnored = false,
-                        lastSyncedAt = null,
-                        isDeletedFromDevice = false
-                    )
+                list += FileEntryEntity(
+                    path = path,
+                    name = name,
+                    folderPath = parentPath ?: "",
+                    folderName = bucket,
+                    sizeBytes = size,
+                    lastModified = modified,
+                    mimeType = mime,
+                    fileType = fileType.name,
+                    width = width,
+                    height = height,
+                    durationMs = duration,
+                    orientation = null,
+                    cameraMake = null,
+                    cameraModel = null,
+                    hasGps = false,
+                    dateTaken = dateTaken,
+                    dateAdded = dateAdded,
+                    isHidden = if (!isContentUri) FileUtils.isHidden(File(path)) else false,
+                    contentHash = null,
+                    thumbnailCachePath = null,
+                    isSyncIgnored = false,
+                    lastSyncedAt = null,
+                    isDeletedFromDevice = false
                 )
-
-                if (entities.size >= 500) {
-                    fileEntryDao.upsertAll(entities.toList())
-                    count += entities.size
-                    entities.clear()
-                }
             }
-
-            if (entities.isNotEmpty()) {
-                fileEntryDao.upsertAll(entities)
-                count += entities.size
-            }
-
-            if (skippedCount > 0) {
-                Log.d(TAG, "Skipped $skippedCount MediaStore entries because the file path could not be resolved")
-            }
+            return list
         }
 
-        Log.d(TAG, "performMediaStoreScan: indexed $count files into Room")
-        return count
+        suspend fun queryAndStore(
+            uri: android.net.Uri,
+            proj: Array<String>,
+            defaultType: FileType?
+        ): Int {
+            val cursor = try {
+                context.contentResolver.query(
+                    uri, proj, null, null,
+                    "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "MediaStore query failed for $uri: ${e.message}", e)
+                return 0
+            }
+            if (cursor == null) {
+                Log.w(TAG, "Null cursor for $uri — READ_MEDIA_* permissions may be missing")
+                return 0
+            }
+            var n = 0
+            cursor.use {
+                val entities = it.extractEntities(defaultType)
+                entities.chunked(500).forEach { chunk ->
+                    fileEntryDao.upsertAll(chunk)
+                    n += chunk.size
+                }
+            }
+            Log.d(TAG, "  $uri → $n new entries (dedup pool: ${seenPaths.size})")
+            return n
+        }
+
+        Log.d(TAG, "performMediaStoreScan: starting 4-phase scan")
+
+        // Phase 1 — Images (DATE_TAKEN gives better sort-by-date)
+        total += queryAndStore(
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            baseProjection(MediaStore.Images.ImageColumns.DATE_TAKEN),
+            FileType.PHOTO
+        )
+
+        // Phase 2 — Videos (DURATION + DATE_TAKEN)
+        total += queryAndStore(
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+            baseProjection(
+                MediaStore.Video.VideoColumns.DURATION,
+                MediaStore.Images.ImageColumns.DATE_TAKEN
+            ),
+            FileType.VIDEO
+        )
+
+        // Phase 3 — Audio (DURATION)
+        total += queryAndStore(
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+            baseProjection(MediaStore.Audio.AudioColumns.DURATION),
+            FileType.AUDIO
+        )
+
+        // Phase 4 — All files (catches documents, APKs, archives, etc.)
+        // ⚠ NO SIZE > 0 filter: Android 15 can store NULL size before full indexing,
+        //   and NULL > 0 is FALSE in SQL — silently excluding ALL unindexed files.
+        // Already-seen paths (from phases 1-3) are skipped via seenPaths dedup.
+        total += queryAndStore(
+            MediaStore.Files.getContentUri("external"),
+            baseProjection(),
+            null
+        )
+
+        Log.d(TAG, "performMediaStoreScan: complete — indexed $total files")
+        total
     }
 
     override suspend fun performFileSystemWalk(

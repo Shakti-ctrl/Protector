@@ -21,7 +21,7 @@ on:
 jobs:
   build:
     name: Build Debug APK
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout code
@@ -35,13 +35,21 @@ jobs:
           cache: gradle
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Accept Android SDK licenses
-        run: yes | sdkmanager --licenses || true
-
-      - name: Install required SDK components
         run: |
+          ANDROID_SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=${ANDROID_SDK_ROOT}" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}" >> $GITHUB_ENV
+          CMDLINE_TOOLS="${ANDROID_SDK_ROOT}/cmdline-tools"
+          if [ -d "${CMDLINE_TOOLS}/latest/bin" ]; then
+            echo "${CMDLINE_TOOLS}/latest/bin" >> $GITHUB_PATH
+          elif [ -d "${CMDLINE_TOOLS}/bin" ]; then
+            echo "${CMDLINE_TOOLS}/bin" >> $GITHUB_PATH
+          fi
+          echo "${ANDROID_SDK_ROOT}/platform-tools" >> $GITHUB_PATH
+
+      - name: Accept licenses and install SDK components
+        run: |
+          yes | sdkmanager --licenses || true
           sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
       - name: Cache Gradle dependencies

@@ -24,6 +24,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.distinctUntilChangedBy
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
@@ -57,6 +58,9 @@ class DashboardViewModel @Inject constructor(
     val lastScanAt: StateFlow<Long?> = appPreferences.lastScanAt
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
+    val initialScanDone: StateFlow<Boolean> = appPreferences.initialScanDone
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), true)
+
     private val _isScanning = MutableStateFlow(false)
     val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
 
@@ -83,6 +87,13 @@ class DashboardViewModel @Inject constructor(
                 _scanStage.value = workInfo?.progress?.getString(ScanWorker.KEY_PROGRESS_STAGE)
             }
             .launchIn(viewModelScope)
+
+        viewModelScope.launch {
+            val done = appPreferences.initialScanDone.first()
+            if (!done) {
+                triggerInitialScan()
+            }
+        }
     }
 
     fun triggerScan() {
@@ -101,7 +112,7 @@ class DashboardViewModel @Inject constructor(
             _isScanning.value = true
             val request = OneTimeWorkRequestBuilder<ScanWorker>()
                 .setInputData(workDataOf(ScanWorker.KEY_IS_INITIAL to true))
-                .addTag("initial_scan")
+                .addTag(SCAN_WORK_TAG)
                 .build()
             WorkManager.getInstance(context).enqueue(request)
         }
